@@ -617,7 +617,22 @@
     </div>
   </div>
 
-  <div class="row" style="margin-top:12px;">
+      <!-- BANNER DE PROCESSAMENTO 100% AUTOMÁTICO (1 CLIQUE) -->
+    <div class="card" style="margin-bottom:16px; padding:14px 18px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; background:linear-gradient(135deg, rgba(37,99,235,0.12), rgba(30,64,175,0.06)); border:1px solid rgba(37,99,235,0.35); border-radius:10px;">
+      <div style="display:flex; align-items:center; gap:14px;">
+        <div style="width:42px; height:42px; border-radius:8px; background:#2563eb; display:flex; align-items:center; justify-content:center; font-size:22px; color:#fff; box-shadow:0 4px 12px rgba(37,99,235,0.4);">⚡</div>
+        <div>
+          <div style="font-weight:800; font-size:15px; color:var(--text);">Modo Automático: Base IBrA B3 (151 Ações + IBOV)</div>
+          <div style="font-size:12px; color:var(--muted); margin-top:2px;">Analisa toda a base oficial da B3 instantaneamente, sem precisar selecionar arquivos no computador.</div>
+        </div>
+      </div>
+      <button id="btnAutoProcessIbra" onclick="autoProcessIbra()" style="background:linear-gradient(135deg, #2563eb, #1d4ed8); color:#ffffff; border:none; font-weight:700; font-size:13px; padding:10px 22px; border-radius:8px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; box-shadow:0 4px 14px rgba(37,99,235,0.35); transition:all 0.2s ease;">
+        <span id="autoProcessIcon">⚡</span>
+        <span id="autoProcessText">Processar IBrA Automático (1 Clique)</span>
+      </button>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
     <div class="card">
       <label>1) Selecione VÁRIOS CSVs (um por ação)</label>
       <input id="files" type="file" multiple accept=".csv" />
@@ -1539,14 +1554,22 @@
       const t = rows[0]?.ticker?.trim();
       return t ? t : fallbackName.replace(/\.csv$/i, '').trim();
     }
-    function readFileAsText(file) {
-      return new Promise((resolve, reject) => {
-        const r = new FileReader();
-        r.onload = () => resolve(r.result);
-        r.onerror = () => reject(r.error);
-        r.readAsText(file, 'latin1');
-      });
+        async function readFileAsText(file, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          return await new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result);
+            r.onerror = () => reject(r.error || new Error('Falha ao ler arquivo'));
+            r.readAsText(file, 'latin1');
+          });
+        } catch (err) {
+          if (attempt === maxRetries) throw err;
+          await new Promise(res => setTimeout(res, 120));
+        }
+      }
     }
+
 
     // ===== indicators (mesmas regras)
     function ema(values, period) {
@@ -3142,22 +3165,302 @@
 
 
     // ===== process
+        // =========================================================
+    // === MOTOR DE PROCESSAMENTO (DATASET & AUTOMÁTICO) =======
+    // =========================================================
+
+    async function processDataset(fileItems, benchData) {
+      const scoreMin = Number(document.getElementById('scoreMin').value || 10);
+      log(`Iniciando análise… ativos: ${fileItems.length}`);
+      tableData = []; filteredData = [];
+      stateByTicker.clear();
+      lastNewOps = []; lastOpenOps = [];
+
+      let ok = 0, err = 0;
+      let scoreSum = 0, scoreCount = 0;
+      const errorMessages = [];
+
+      for (let i = 0; i < fileItems.length; i++) {
+        const item = fileItems[i];
+        const itemName = item.name || `Ativo_${i + 1}`;
+        if (i % 25 === 0 || i === fileItems.length - 1) {
+          log(`Processando (${i + 1}/${fileItems.length}): ${itemName}\nOK: ${ok} | Erros: ${err}`);
+        }
+
+        try {
+          const text = (item.text != null) ? item.text : (await readFileAsText(item));
+          const rows = parseCSV(text);
+          const ticker = normalizeTicker(rows, itemName);
+
+          const computed = buildComputed(rows);
+
+          // Mapear gate do benchmark se fornecido
+          if (benchData) {
+            const bgOk = new Array(computed.close.length).fill(true);
+            for (let bi = 0; bi < computed.date.length; bi++) {
+              const dt = computed.date[bi].getTime();
+              for (let bj = benchData.dates.length - 1; bj >= 0; bj--) {
+                if (benchData.dates[bj] <= dt) {
+                  bgOk[bi] = (benchData.ema200[bj] != null) ? (benchData.close[bj] > benchData.ema200[bj]) : true;
+                  break;
+                }
+              }
+            }
+            computed.benchGateOk = bgOk;
+          }
+
+          const scoreBruto = computed.score[computed.score.length - 1];
+          const scoreZval = (computed.scoreZarr && computed.scoreZarr[computed.scoreZarr.length - 1]);
+          const scoreZ = isNum(scoreZval) ? Math.round(scoreZval * 100) / 100 : null;
+          const { closeD1, varD1 } = lastCloseAndVar(computed);
+
+          const sim = simulateLongOnly(computed, {
+            scoreEntry: scoreMin,
+            cooldownCandles: 5,
+            stopPct: 0.05,
+            initAtrK: 2.2,
+            trailAtrK: 2.0,
+            swingLen: 5,
+            beR: 1.2
+          }, computed.close.length - 1);
+
+          const lastIdx = computed.close.length - 1;
+          const simPrev = (lastIdx >= 1) ? simulateLongOnly(computed, {
+            scoreEntry: scoreMin,
+            cooldownCandles: 5,
+            stopPct: 0.05,
+            initAtrK: 2.2,
+            trailAtrK: 2.0,
+            swingLen: 5,
+            beR: 1.2
+          }, lastIdx - 1) : simulateLongOnly(computed, {
+            scoreEntry: scoreMin,
+            cooldownCandles: 5,
+            stopPct: 0.05,
+            initAtrK: 2.2,
+            trailAtrK: 2.0,
+            swingLen: 5,
+            beR: 1.2
+          }, lastIdx);
+
+          const stats = backtestStats(computed, {
+            scoreEntry: scoreMin,
+            cooldownCandles: 5,
+            stopPct: 0.05,
+            initAtrK: 2.2,
+            trailAtrK: 2.0,
+            swingLen: 5,
+            beR: 1.2
+          });
+
+          const entryDateStr = sim.entryDate ? sim.entryDate.toLocaleDateString('pt-BR') : '';
+          const entryDateTS = sim.entryDate ? sim.entryDate.getTime() : null;
+          const inTrade = sim.entryIndexFinal >= 0;
+          const stopNow = sim.stopNow;
+          const stopPrev = simPrev ? simPrev.stopNow : null;
+
+          const newEntry = (sim.entryIndexFinal >= 0) &&
+            (sim.entryIndexFinal === lastIdx) &&
+            (simPrev ? (simPrev.entryIndexFinal < 0 || simPrev.entryIndexFinal !== sim.entryIndexFinal) : true);
+
+          const stopChanged = (inTrade === true) &&
+            isNum(stopNow) && isNum(stopPrev) &&
+            (stopNow > (stopPrev + 1e-9));
+
+          const stopDeltaAbs = stopChanged ? (stopNow - stopPrev) : 0;
+          const stopDeltaPct = stopChanged && isNum(stopPrev) && stopPrev !== 0 ? (stopDeltaAbs / stopPrev) : null;
+          const stopDistPct = (inTrade && isNum(stopNow) && isNum(closeD1) && closeD1 !== 0)
+            ? ((closeD1 - stopNow) / closeD1) : null;
+          const riskToStop = stopDistPct;
+          const cooldownLeft = sim.cooldownLeftLast ?? 0;
+
+          const sigVal = (scoreZ != null) ? scoreZ : (scoreBruto ?? 0);
+          const signal = (sigVal >= scoreMin) &&
+            (computed.gateOk && computed.gateOk[computed.gateOk.length - 1] === true) &&
+            (computed.benchGateOk ? computed.benchGateOk[computed.benchGateOk.length - 1] === true : true);
+
+          let selected = false;
+          try {
+            const saved = JSON.parse(localStorage.getItem(LS.selected) || '{}');
+            selected = !!(saved && saved[ticker]);
+          } catch (_) { }
+
+          tableData.push({
+            ticker,
+            scoreZ,
+            scoreBruto,
+            closeD1,
+            varD1,
+            signal,
+            inTrade,
+            cooldownLeft,
+            entryDateStr,
+            entryDateTS,
+            entryPx: sim.entryPx,
+            stopNow,
+            stopPrev,
+            newEntry,
+            stopChanged,
+            stopDeltaAbs,
+            stopDeltaPct,
+            stopDistPct,
+            riskToStop,
+            pctNow: sim.pctNow,
+            trades: stats.trades,
+            winrate: stats.winrate,
+            totalRet: stats.totalRet,
+            maxDD: stats.maxDD,
+            gateOkLast: (computed.gateOk && computed.gateOk[computed.gateOk.length - 1] === true),
+            selected,
+            nextStop: sim.nextStop,
+            nextTarget: sim.nextTarget,
+            error: ''
+          });
+
+          stateByTicker.set(ticker, { rows, computed });
+          ok++;
+          if (isNum(scoreZ)) { scoreSum += scoreZ; scoreCount++; }
+
+        } catch (e) {
+          err++;
+          const errTicker = itemName.replace(/\.csv$/i, '');
+          errorMessages.push(`${errTicker}: ${(e && e.message) ? e.message : String(e)}`);
+          tableData.push({
+            ticker: errTicker,
+            scoreZ: null, closeD1: null, varD1: null,
+            signal: false, inTrade: false,
+            cooldownLeft: 0,
+            entryDateStr: '', entryDateTS: null,
+            entryPx: null, stopNow: null, riskToStop: null, pctNow: null,
+            trades: null, winrate: null, totalRet: null, maxDD: null, gateOkLast: false,
+            selected: false,
+            error: (e && e.message) ? e.message : String(e)
+          });
+        }
+      }
+
+      // Restaura seleção persistida
+      try {
+        const saved = JSON.parse(localStorage.getItem(LS.selected) || '{}');
+        tableData.forEach(r => { if (!r.error && saved && saved[r.ticker]) r.selected = true; });
+      } catch (_) { }
+
+      // NOVAS
+      lastNewOps = tableData
+        .filter(r => !r.error)
+        .filter(r => (r.inTrade === false) && (r.signal === true) && ((r.cooldownLeft ?? 0) === 0))
+        .sort((a, b) => (b.scoreZ - a.scoreZ));
+
+      // EM ANDAMENTO
+      lastOpenOps = tableData
+        .filter(r => !r.error)
+        .filter(r => r.inTrade === true)
+        .sort((a, b) => (b.scoreZ - a.scoreZ));
+
+      // Log de erros
+      const errLogCard = document.getElementById('errorLogCard');
+      const errLogList = document.getElementById('errorLogList');
+      const errCountEl = document.getElementById('errCount');
+      if (errorMessages.length > 0 && errLogCard && errLogList) {
+        if (errCountEl) errCountEl.textContent = errorMessages.length;
+        errLogList.textContent = errorMessages.join('\n');
+        errLogCard.style.display = 'block';
+      } else if (errLogCard) {
+        errLogCard.style.display = 'none';
+      }
+
+      renderNewOps(lastNewOps);
+      renderSignalCards(lastNewOps);
+      initAlertButtons();
+
+      const avgScore = scoreCount ? (scoreSum / scoreCount) : null;
+      setSummary({
+        total: fileItems.length, ok, err,
+        inTrade: lastOpenOps.length,
+        newOps: lastNewOps.length,
+        avgScore
+      });
+
+      currentSort = { key: 'scoreZ', dir: 'desc' };
+      applyFilterAndRender();
+      log(`Concluído.\nArquivos: ${fileItems.length} | OK: ${ok} | Erros: ${err}\n\nDica: clique no ticker ou nos Cards de Sinal para ver o gráfico.`);
+    }
+
+    // Processamento Automático do IBrA via Servidor Local
+    window.autoProcessIbra = async function() {
+      const btn = document.getElementById('btnAutoProcessIbra');
+      const icon = document.getElementById('autoProcessIcon');
+      const txt = document.getElementById('autoProcessText');
+
+      if (btn) {
+        btn.disabled = true;
+        btn.style.opacity = '0.85';
+        if (icon) icon.textContent = '⏳';
+        if (txt) txt.textContent = 'Carregando 151 ações do IBrA...';
+      }
+
+      try {
+        log('Solicitando base completa do IBrA ao servidor local...');
+        const res = await fetch('http://localhost:8505/api/ibra_bundle');
+        const bundle = await res.json();
+
+        if (!bundle || bundle.status !== 'ok' || !bundle.files || bundle.files.length === 0) {
+          throw new Error('Servidor local não respondeu com a lista de ativos.');
+        }
+
+        // Processa benchmark IBOV
+        let benchData = null;
+        if (bundle.benchmark_text) {
+          try {
+            const benchRows = parseCSV(bundle.benchmark_text);
+            const benchClose = benchRows.map(r => r.close);
+            const benchEma200 = ema(benchClose, 200);
+            const benchDates = benchRows.map(r => r.date.getTime());
+            benchData = { dates: benchDates, close: benchClose, ema200: benchEma200 };
+            log(`Benchmark IBOV carregado: ${benchRows.length} candles.`);
+          } catch (e) {
+            log('Aviso: benchmark IBOV não lido (' + (e.message || e) + ')');
+          }
+        }
+
+        log(`Analisando ${bundle.files.length} ações da B3...`);
+        await processDataset(bundle.files, benchData);
+
+        if (icon) icon.textContent = '✅';
+        if (txt) txt.textContent = '151 Ações Processadas!';
+      } catch (err) {
+        console.error('AutoProcess error:', err);
+        alert(`⚠️ Para usar o processamento 100% automático em 1 clique:\n\nInicie a aplicação dando 2 cliques no arquivo:\n"1_ABRIR_SCORE_SCANNER.bat"\nna pasta EXECUTAVEIS MESA (ele ativa o servidor local de alta velocidade).\n\nDetalhe: ${err.message}`);
+      } finally {
+        setTimeout(() => {
+          if (btn) {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            if (icon) icon.textContent = '⚡';
+            if (txt) txt.textContent = 'Processar IBrA Automático (1 Clique)';
+          }
+        }, 3500);
+      }
+    };
+
+    // Auto-carregar automaticamente ao abrir via http://localhost:8505
+    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+      window.addEventListener('DOMContentLoaded', () => {
+        setTimeout(() => {
+          try { window.autoProcessIbra(); } catch (_) {}
+        }, 800);
+      });
+    }
+
+    // ===== Botão manual 'Processar' (para arquivos selecionados manualmente)
     document.getElementById('run').addEventListener('click', async () => {
       try {
         const files = document.getElementById('files').files;
-        const scoreMin = Number(document.getElementById('scoreMin').value || 10);
-
         if (!files || files.length === 0) {
-          alert('Selecione os CSVs primeiro.');
+          alert('Selecione os CSVs primeiro ou use o botão "Processar IBrA Automático" acima.');
           return;
         }
 
-        log(`Iniciando… arquivos: ${files.length}`);
-        tableData = []; filteredData = [];
-        stateByTicker.clear();
-        lastNewOps = []; lastOpenOps = [];
-
-        // === v28: carregar benchmark IBOV se fornecido ===
         let benchData = null;
         const benchFileEl = document.getElementById('fileBench');
         const benchFiles = benchFileEl ? benchFileEl.files : null;
@@ -3169,223 +3472,14 @@
             const benchEma200 = ema(benchClose, 200);
             const benchDates = benchRows.map(r => r.date.getTime());
             benchData = { dates: benchDates, close: benchClose, ema200: benchEma200 };
-            log('Benchmark IBOV carregado: ' + benchRows.length + ' candles.');
           } catch (e) {
-            log('Aviso: benchmark ignorado (' + (e.message || e) + ')');
+            log('Aviso: benchmark manual ignorado (' + (e.message || e) + ')');
           }
         }
 
-        let ok = 0, err = 0;
-        let scoreSum = 0, scoreCount = 0;
-        const errorMessages = []; // v29: error log
-
-        for (let i = 0; i < files.length; i++) {
-          const f = files[i];
-          log(`Processando (${i + 1}/${files.length}): ${f.name}\nOK: ${ok} | Erros: ${err}`);
-
-          try {
-            const text = await readFileAsText(f);
-            const rows = parseCSV(text);
-            const ticker = normalizeTicker(rows, f.name);
-
-            const computed = buildComputed(rows);
-
-            // v28: mapear gate do benchmark
-            if (benchData) {
-              const bgOk = new Array(computed.close.length).fill(true);
-              for (let bi = 0; bi < computed.date.length; bi++) {
-                const dt = computed.date[bi].getTime();
-                for (let bj = benchData.dates.length - 1; bj >= 0; bj--) {
-                  if (benchData.dates[bj] <= dt) {
-                    bgOk[bi] = (benchData.ema200[bj] != null) ? (benchData.close[bj] > benchData.ema200[bj]) : true;
-                    break;
-                  }
-                }
-              }
-              computed.benchGateOk = bgOk;
-            }
-
-            const scoreBruto = computed.score[computed.score.length - 1];
-            const scoreZval = (computed.scoreZarr && computed.scoreZarr[computed.scoreZarr.length - 1]);
-            const scoreZ = isNum(scoreZval) ? Math.round(scoreZval * 100) / 100 : null;
-            const { closeD1, varD1 } = lastCloseAndVar(computed);
-
-            const sim = simulateLongOnly(computed, {
-              scoreEntry: scoreMin,
-              cooldownCandles: 5,
-              stopPct: 0.05,
-              initAtrK: 2.2,
-              trailAtrK: 2.0,
-              swingLen: 5,
-              beR: 1.2
-            }, computed.close.length - 1);
-
-
-            const lastIdx = computed.close.length - 1;
-            const simPrev = (lastIdx >= 1) ? simulateLongOnly(computed, {
-              scoreEntry: scoreMin,
-              cooldownCandles: 5,
-              stopPct: 0.05,
-              initAtrK: 2.2,
-              trailAtrK: 2.0,
-              swingLen: 5,
-              beR: 1.2
-            }, lastIdx - 1) : simulateLongOnly(computed, {
-              scoreEntry: scoreMin,
-              cooldownCandles: 5,
-              stopPct: 0.05,
-              initAtrK: 2.2,
-              trailAtrK: 2.0,
-              swingLen: 5,
-              beR: 1.2
-            }, lastIdx);
-
-            const stats = backtestStats(computed, {
-              scoreEntry: scoreMin,
-              cooldownCandles: 5,
-              stopPct: 0.05,
-              initAtrK: 2.2,
-              trailAtrK: 2.0,
-              swingLen: 5,
-              beR: 1.2
-            });
-
-            const entryDateStr = sim.entryDate ? sim.entryDate.toLocaleDateString('pt-BR') : '';
-            const entryDateTS = sim.entryDate ? sim.entryDate.getTime() : null;
-
-            const inTrade = sim.entryIndexFinal >= 0;
-            const stopNow = sim.stopNow;
-            const stopPrev = simPrev ? simPrev.stopNow : null;
-
-            const newEntry = (sim.entryIndexFinal >= 0) &&
-              (sim.entryIndexFinal === lastIdx) &&
-              (simPrev ? (simPrev.entryIndexFinal < 0 || simPrev.entryIndexFinal !== sim.entryIndexFinal) : true);
-
-            const stopChanged = (inTrade === true) &&
-              isNum(stopNow) && isNum(stopPrev) &&
-              (stopNow > (stopPrev + 1e-9));
-
-            const stopDeltaAbs = stopChanged ? (stopNow - stopPrev) : 0;
-            const stopDeltaPct = stopChanged && isNum(stopPrev) && stopPrev !== 0 ? (stopDeltaAbs / stopPrev) : null;
-
-            const stopDistPct = (inTrade && isNum(stopNow) && isNum(closeD1) && closeD1 !== 0)
-              ? ((closeD1 - stopNow) / closeD1)
-              : null;
-
-
-            const riskToStop = (inTrade && isNum(stopNow) && isNum(closeD1))
-              ? ((closeD1 - stopNow) / closeD1)
-              : null;
-
-            const cooldownLeft = sim.cooldownLeftLast ?? 0;
-            const signal = (isNum(scoreZ) ? (scoreZ >= scoreMin) : false);
-
-            // ✅ default: auto-seleciona tudo que scoreZ>=X
-            const selected = (!isNaN(scoreZ) && signal);
-
-            tableData.push({
-              ticker,
-              scoreBruto,
-              scoreZ,
-              closeD1,
-              varD1,
-              signal,
-              inTrade,
-              cooldownLeft,
-              entryDateStr,
-              entryDateTS,
-              entryPx: sim.entryPx,
-              stopNow,
-              stopPrev,
-              newEntry,
-              stopChanged,
-              stopDeltaAbs,
-              stopDeltaPct,
-              stopDistPct,
-              riskToStop,
-              pctNow: sim.pctNow,
-              trades: stats.trades,
-              winrate: stats.winrate,
-              totalRet: stats.totalRet,
-              maxDD: stats.maxDD,
-              gateOkLast: (computed.gateOk && computed.gateOk[computed.gateOk.length - 1] === true),
-              selected,
-              nextStop: sim.nextStop,
-              nextTarget: sim.nextTarget,
-              error: ''
-            });
-
-            stateByTicker.set(ticker, { rows, computed });
-            ok++;
-            if (isNum(scoreZ)) { scoreSum += scoreZ; scoreCount++; }
-
-          } catch (e) {
-            err++;
-            const errTicker = f.name.replace(/\.csv$/i, '');
-            errorMessages.push(`${errTicker}: ${(e && e.message) ? e.message : String(e)}`);
-            tableData.push({
-              ticker: errTicker,
-              scoreZ: null, closeD1: null, varD1: null,
-              signal: false, inTrade: false,
-              cooldownLeft: 0,
-              entryDateStr: '', entryDateTS: null,
-              entryPx: null, stopNow: null, riskToStop: null, pctNow: null,
-              trades: null, winrate: null, totalRet: null, maxDD: null, gateOkLast: false,
-              selected: false,
-              error: (e && e.message) ? e.message : String(e)
-            });
-          }
-        }
-
-
-        // restaura seleção persistida (se existir)
-        try {
-          const saved = JSON.parse(localStorage.getItem(LS.selected) || '{}');
-          tableData.forEach(r => { if (!r.error && saved && saved[r.ticker]) r.selected = true; });
-        } catch (_) { }
-        // NOVAS: sem operação + scoreZ >= X + cooldown = 0
-        lastNewOps = tableData
-          .filter(r => !r.error)
-          .filter(r => (r.inTrade === false) && (r.signal === true) && ((r.cooldownLeft ?? 0) === 0))
-          .sort((a, b) => (b.scoreZ - a.scoreZ));
-
-        // EM ANDAMENTO
-        lastOpenOps = tableData
-          .filter(r => !r.error)
-          .filter(r => r.inTrade === true)
-          .sort((a, b) => (b.scoreZ - a.scoreZ));
-
-        // v29: Error Log visible
-        const errLogCard = document.getElementById('errorLogCard');
-        const errLogList = document.getElementById('errorLogList');
-        const errCountEl = document.getElementById('errCount');
-        if (errorMessages.length > 0 && errLogCard && errLogList) {
-          if (errCountEl) errCountEl.textContent = errorMessages.length;
-          errLogList.textContent = errorMessages.join('\n');
-          errLogCard.style.display = 'block';
-        } else if (errLogCard) {
-          errLogCard.style.display = 'none';
-        }
-
-        renderNewOps(lastNewOps);
-        renderSignalCards(lastNewOps); // v29: signal cards
-        initAlertButtons();
-
-        const avgScore = scoreCount ? (scoreSum / scoreCount) : null;
-        setSummary({
-          total: files.length, ok, err,
-          inTrade: lastOpenOps.length,
-          newOps: lastNewOps.length,
-          avgScore
-        });
-
-        currentSort = { key: 'scoreZ', dir: 'desc' };
-        applyFilterAndRender();
-
-        log(`Concluído v29.\nArquivos: ${files.length} | OK: ${ok} | Erros: ${err}\n\nDica: clique no ticker ou nos Cards de Sinal para ver o gráfico.`);
-
-      } catch (e) {
-        log('Falha geral:\n' + (e?.message || e));
+        await processDataset(Array.from(files), benchData);
+      } catch (err) {
+        log('Erro no processamento manual: ' + (err.message || err));
       }
     });
 
